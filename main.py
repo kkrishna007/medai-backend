@@ -71,9 +71,9 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "app", "models")
 
-BLINDNESS_MODEL_PATH = os.path.join(MODEL_DIR, "blindness_model.h5")
-BRAIN_TUMOR_MODEL_PATH = os.path.join(MODEL_DIR, "brain_tumor.h5")
-PNEUMONIA_MODEL_PATH = os.path.join(MODEL_DIR, "pneumonia_detection_Vision_Model.h5")
+BLINDNESS_MODEL_PATH = os.environ.get("BLINDNESS_MODEL_PATH", os.path.join(MODEL_DIR, "blindness_model.h5"))
+BRAIN_TUMOR_MODEL_PATH = os.environ.get("BRAIN_TUMOR_MODEL_PATH", os.path.join(MODEL_DIR, "brain_tumor.h5"))
+PNEUMONIA_MODEL_PATH = os.environ.get("PNEUMONIA_MODEL_PATH", os.path.join(MODEL_DIR, "pneumonia_detection_Vision_Model.h5"))
 
 # Enhanced path logging
 logger.info(f"📁 Model directory: {MODEL_DIR}")
@@ -1028,53 +1028,6 @@ async def predict_blindness(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"❌ Error in blindness prediction: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-def real_lime_explanation(model, image_np):
-    # image_np: shape (H, W, 3), uint8 or float32 in [0,255]
-    explainer = lime_image.LimeImageExplainer()
-    def predict_fn(imgs):
-        # imgs: (N, H, W, 3), float64 in [0,1]
-        imgs = np.array(imgs)
-        # Rescale to 0-255 and preprocess as your model expects
-        imgs_scaled = (imgs * 255).astype(np.uint8)
-        return model.predict(imgs_scaled)
-    
-    explanation = explainer.explain_instance(
-        image_np.astype(np.double) / 255.0,
-        predict_fn,
-        top_labels=1,
-        hide_color=0,
-        num_samples=1000
-    )
-    # Get the mask for the top predicted class
-    temp, mask = explanation.get_image_and_mask(
-        explanation.top_labels[0],
-        positive_only=True,
-        num_features=10,
-        hide_rest=False
-    )
-    # Overlay boundaries
-    lime_img = mark_boundaries(temp, mask)
-    lime_img = (lime_img * 255).astype(np.uint8)
-    return lime_img
-
-def real_shap_explanation(model, image_np):
-    # image_np: shape (H, W, 3), uint8 or float32 in [0,255]
-    try:
-        # SHAP expects a batch of images
-        background = np.zeros((1, *image_np.shape), dtype=np.uint8)
-        explainer = shap.GradientExplainer(model, background)
-        shap_values = explainer.shap_values(image_np[np.newaxis, ...])
-        # shap_values is a list (one per class); use the predicted class
-        pred_class = int(np.argmax(model.predict(image_np[np.newaxis, ...])))
-        shap_img = shap_values[pred_class][0]
-        # Normalize for visualization
-        shap_img_norm = (shap_img - shap_img.min()) / (shap_img.max() - shap_img.min() + 1e-8)
-        shap_img_vis = (shap_img_norm * 255).astype(np.uint8)
-        shap_img_vis = cv2.applyColorMap(shap_img_vis, cv2.COLORMAP_VIRIDIS)
-        return shap_img_vis
-    except Exception as e:
-        print(f"SHAP failed: {e}")
-        return None  # Fallback will be used in the endpoint
 
 @app.post("/predict/brain-tumor")
 async def predict_brain_tumor(file: UploadFile = File(...)):
@@ -1082,79 +1035,34 @@ async def predict_brain_tumor(file: UploadFile = File(...)):
     if brain_tumor_model is None:
         logger.error("❌ Brain tumor model not loaded")
         raise HTTPException(status_code=503, detail="Brain tumor model not loaded")
-
+    
     try:
         with PerformanceLogger("Brain Tumor Prediction"):
             contents = await file.read()
-            processed_image = preprocess_brain_image(contents)  # shape (1, H, W, 3)
-            original_image = processed_image[0] if processed_image.shape[0] == 1 else processed_image
-
+            processed_image = preprocess_brain_image(contents)
             prediction = brain_tumor_model.predict(processed_image)
+            
             predicted_class = int(np.argmax(prediction[0]))
             confidence = float(prediction[0][predicted_class])
+            
             tumor_map = {
                 0: "Glioma Tumor", 1: "Meningioma Tumor",
                 2: "No Tumor Found", 3: "Pituitary Tumor"
             }
-
-            # --- Grad-CAM with fallback ---
-            try:
-                gradcam_img = get_gradcam_overlay(
-                    brain_tumor_model,
-                    processed_image,
-                    last_conv_layer_name='block6d_project_conv',  # or 'top_conv'
-                    class_index=predicted_class,
-                    alpha=0.4
-                )
-                gradcam_img_b64 = gradcam_img
-            except Exception as gradcam_error:
-                logger.warning(f"⚠️ Grad-CAM failed: {gradcam_error}. Using fallback intensity heatmap.")
-                fallback_img = create_intensity_heatmap(original_image, predicted_class)
-                gradcam_img_b64 = image_to_base64(fallback_img)
-
-            # --- LIME (no fallback needed, rarely fails) ---
-            try:
-                lime_img = real_lime_explanation(brain_tumor_model, original_image)
-                lime_img_b64 = image_to_base64(lime_img) if lime_img is not None else None
-            except Exception as lime_error:
-                logger.error(f"❌ LIME failed: {lime_error}")
-                lime_img_b64 = None
-
-            # --- SHAP with fallback ---
-            # try:
-            #     shap_img = real_shap_explanation(brain_tumor_model, original_image)
-            #     shap_img_b64 = image_to_base64(shap_img) if shap_img is not None else None
-            #     if shap_img_b64 is None:
-            #         raise Exception("SHAP returned None")
-            # except Exception as shap_error:
-            #     logger.warning(f"⚠️ SHAP failed: {shap_error}. Using fallback attention visualization.")
-            attention_img = create_attention_visualization(original_image, predicted_class, confidence)
-            shap_img_b64 = image_to_base64(attention_img)
-
-            # --- Explanation object ---
-            explanation = {
-                "gradcam_image": gradcam_img_b64,
-                "lime_image": lime_img_b64,
-                "shap_image": shap_img_b64
-                # Add more XAI outputs here as you implement them
-            }
-
+            
             result = {
                 "prediction": predicted_class,
                 "tumor_type": tumor_map[predicted_class],
                 "confidence": confidence,
-                "raw_prediction": prediction[0].tolist(),
-                "explanation": explanation
+                "raw_prediction": prediction[0].tolist()
             }
-
+            
             logger.info(f"✅ Brain tumor prediction: {result['tumor_type']} (confidence: {confidence:.3f})")
             return result
-
+            
     except Exception as e:
         logger.error(f"❌ Error in brain tumor prediction: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
 
 if __name__ == "__main__":
     import uvicorn
